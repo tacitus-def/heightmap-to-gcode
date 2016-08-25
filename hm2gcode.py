@@ -24,9 +24,11 @@
 import cv2
 import sys
 import math
+import time
 import numpy
 import argparse
 from PIL import Image, ImageDraw
+import PIL.ImageOps
 
 c_points = [[-1,-1], [0, -1], [1, -1], [-1, 0], [1, 0], [-1, 1], [0, 1], [1, 1]]
 
@@ -55,7 +57,7 @@ def get_levels(matrix, width, length):
 			if not key in cache and key != 255:
 				cache [key] = 1
 				levels.append(key)
-	levels.sort()
+	levels.sort(reverse=True)
 	return levels
 	
 def draw_level(canvas, matrix, level):
@@ -66,10 +68,16 @@ def draw_level(canvas, matrix, level):
 	pixels = canvas.load()
 	for i in range(width):
 		for j in range(length):
-			if level == matrix[i][j] and pixels[i, j] != 0:
-				color = 0
+			if level > 0:
+				if level > matrix[i][j]:
+					color = 0
+				else:
+					color = 255
 			else:
-				color = 255
+				if matrix[i][j] == 0:
+					color = 0
+				else:
+					color = 255
 			draw.point((i, j), color)
 
 def detect_edge(pixels, x, y, width, length, color):
@@ -90,7 +98,19 @@ def detect_contours(mask):
 	c = sorted(cnts, key = cv2.contourArea, reverse = True)
 	return c
 
-def draw_path(image, mill):
+def draw_area(canvas, cache, width, length, xmill, ymill, color, fcolor):
+	state = False
+	pixels = canvas.load()
+	draw = ImageDraw.Draw(cache)
+	for i in range(width):
+		for j in range(length):
+			detected = detect_edge(pixels, i, j, width, length, color)
+			if detected:
+				draw.ellipse((math.ceil(i - xmill), math.ceil(j - ymill), math.floor(i + xmill), math.floor(j + ymill)), fill = fcolor, outline = fcolor)
+				state = state or detected
+	return state
+
+def draw_path(image, xmill, ymill):
 	width = image.size[0]
 	length = image.size[1]
 
@@ -105,7 +125,8 @@ def draw_path(image, mill):
 	count_edge = 0
 	c = []
 	while state:
-		count = 0
+		state = draw_area(canvas, cache, width, length, xmill, ymill, 0, 255)
+		"""
 		pixels = canvas.load()
 		draw = ImageDraw.Draw(cache)
 		state = False
@@ -113,12 +134,13 @@ def draw_path(image, mill):
 			for j in range(length):
 				detected = detect_edge(pixels, i, j, width, length, 0)
 				if detected:
-					draw.ellipse((math.ceil(i - mill), math.ceil(j - mill), math.floor(i + mill), math.floor(j + mill)), fill = 255, outline = 255)
-					count += 1
+					draw.ellipse((math.ceil(i - xmill), math.ceil(j - ymill), math.floor(i + xmill), math.floor(j + ymill)), fill = 255, outline = 255)
 				state = state or detected
+		"""
 		if state:
 			if not mask_state:
 				mask = cache.copy()
+				draw_area(cache, mask, width, length, xmill, ymill, 255, 0)
 				mask_state = True
 			cache_pixels = cache.load()
 			c += detect_contours(cache)
@@ -132,34 +154,34 @@ def draw_path(image, mill):
 	return (edge, mask, count_edge, c)
 	
 def merge_mask(canvas, mask, width, length):
-	canvas_draw = ImageDraw.Draw(canvas)
+	mask_draw = ImageDraw.Draw(mask)
 	mask_pixels = mask.load()
 	canvas_pixels = canvas.load()
 	for i in range(width):
 		for j in range(length):
-			if mask_pixels[i, j] == 0 and mask_pixels[i, j] == canvas_pixels[i, j]:
-				canvas_draw.point((i, j), 255)
-	return canvas
+			if canvas_pixels[i, j] == 255:
+				mask_draw.point((i, j), 0)
+	return PIL.ImageOps.invert(mask)
 
 def fflt(value):
 	return "{0:.3f}".format(round(value, 3))
 	
-def save_contour(c, name, width, length, height, scale, zscale, step):
+def save_contour(c, name, width, length, height, xscale, yscale, zscale, step, feed):
 	border_delta = 2
 	try:
 		f = open(name, "w")
 		f.write("G21\n")
 		f.write("M3\n")
 		f.write("G00 Z5\n")
+		z = 0
 		for ci in c:
 			for i in ci[0]:
 				draw_to = False
 				max_z = height - zscale * ci[1]
-				z = 0
 				state = True
 				while state:
 					z += step
-					if (z < max_z):
+					if (z <= max_z):
 						z = max_z
 						state = False
 					last = [0, 0]
@@ -170,21 +192,27 @@ def save_contour(c, name, width, length, height, scale, zscale, step):
 						current = [x, y]
 						if (y <= border_delta or y >= length - border_delta) and (x <= border_delta or x >= width - border_delta):
 							if draw_to:
-								f.write("G00" + " X" + fflt(last[0] / scale) + " Y" + fflt(last[1] / scale) + " Z5" + "\n")
+								f.write("G00" + " X" + fflt(last[0] / xscale) + " Y" + fflt(last[1] / yscale) + " Z5" + "\n")
 								draw_to = False
+								feed_rate = False
 							last = current
 							continue
 #						f.write("(X" + str(x) + " Y" + str(y) + ")\n")
 						if draw_to:
-							f.write("G01" + " X" + fflt(x / scale) + " Y" + fflt(y / scale) + " Z" + fflt(z) + "\n")
+							f.write("G01" + " X" + fflt(x / xscale) + " Y" + fflt(y / yscale) + " Z" + fflt(z))
+							if feed_rate:
+								f.write(" F" + fflt(feed))
+								feed_rate = False
+							f.write("\n")
 						else:
 							draw_to = True
-							f.write("G00" + " X" + fflt(x / scale) + " Y" + fflt(y / scale) + " Z5" + "\n")
+							feed_rate = True
+							f.write("G00" + " X" + fflt(x / xscale) + " Y" + fflt(y / yscale) + " Z5" + "\n")
 							f.write("G00" + " Z" + fflt(z) + "\n")
 						last = current
 					p = i[0][0]
 					if draw_to:
-						f.write("G01" + " X" + fflt(p[0] / scale) + " Y" + fflt((length - p[1]) / scale) + " Z" + fflt(z) + "\n")
+						f.write("G01" + " X" + fflt(p[0] / xscale) + " Y" + fflt((length - p[1]) / yscale) + " Z" + fflt(z) + "\n")
 						f.write("G00 Z5\n")
 		f.write("M5\n")
 	finally:
@@ -197,13 +225,14 @@ def progress_bar(progress):
 
 def main():
 	parser = argparse.ArgumentParser()
-	parser.add_argument("--image", "-f", required=True, type=str)
+	parser.add_argument("--image", "-i", required=True, type=str)
 	
 	parser.add_argument("--mill", "-m", required=True, action="append", type=float)
 	
 	parser.add_argument("--width", "-w", required=True, type=float)
 	parser.add_argument("--length", "-l", required=True, type=float)
 	parser.add_argument("--height", "-z", required=True, type=float)
+	parser.add_argument("--feed", "-f", type=float)
 	parser.add_argument("--step", "-s", type=float)
 	args = parser.parse_args()
 	
@@ -213,10 +242,13 @@ def main():
 	
 	img_width = args.width
 	img_length = args.length
-	img_height = args.height
+	img_height = -math.fabs(args.height)
 	step = -1.0
+	feed = 50.0
+	if args.feed:
+		feed = args.feed
 	if args.step:
-		step = args.step
+		step = -math.fabs(args.step)
 	mills = args.mill
 	filepath = args.image
 	mills.sort(reverse=True)
@@ -227,7 +259,8 @@ def main():
 		width = image.size[0]
 		length = image.size[1]
 		
-		scale = width / img_width
+		xscale = width / img_width
+		yscale = length / img_length
 		zscale = img_height / 256
 		matrix = normalize(image)
 		levels = get_levels(matrix, width, length)
@@ -244,16 +277,19 @@ def main():
 			for mill in mills:
 				progress = int(math.floor(progress_counter * 100 / full))
 				progress_bar(progress)
-				
-				(path, mask, count, contours) = draw_path(cache, mill / 2 * scale)
+				mill_radius = mill / 2
+				(path, mask, count, contours) = draw_path(cache, mill_radius * xscale, mill_radius * yscale)
 				if count > 0:
+#					mask.save(str(time.time()) + "mask-" + ".png")
 #					path.save("path" + "-M" + str(mill) + "-L" + str(level) + ".png")
 					cache = merge_mask(cache, mask, width, length)
+#					cache.save(str(time.time()) + "cache-" + ".png")
+#					cache = mask.copy()
 					mill_contours[mill].append([contours, level])
 				progress_counter += 1
 		progress_bar(100)
 		for mill in mills:
-			save_contour(mill_contours [mill], "path" + "-M" + str(mill) + ".ngc", width, length, img_height, scale, zscale, step)
+			save_contour(mill_contours [mill], "path" + "-M" + str(mill) + ".ngc", width, length, img_height, xscale, yscale, zscale, step, feed)
 
 	finally:
 		sys.stdout.write("\n")
